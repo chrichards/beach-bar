@@ -1,8 +1,17 @@
 # Enable WPF
 Add-Type -AssemblyName PresentationCore,PresentationFramework
 
+# Enable Account Management
+Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+
 # One table to rule them all...
 $global:syncHash = [HashTable]::Synchronized(@{})
+
+# Define some table segments
+$syncHash.FilterUsers = [System.Collections.ArrayList]::new()
+$syncHash.AddRemove = [System.Collections.ArrayList]::new()
+$syncHash.AddButton = [System.Collections.ArrayList]::new()
+$syncHash.RemoveButton = [System.Collections.ArrayList]::new()
 
 # Get all groups in the forest
 Function Get-AllGroups {
@@ -15,6 +24,7 @@ Function Get-AllGroups {
         $searcher.PropertiesToLoad.Add("Name") | Out-Null
         $searcher.PropertiesToLoad.Add("Description") | Out-Null
         $searcher.PropertiesToLoad.Add("DistinguishedName") | Out-Null
+        $searcher.PropertiesToLoad.Add("sAMAccountName") | Out-Null
         $searcher.PropertiesToLoad.Add("ManagedBy") | Out-Null
         $searcher.PropertiesToLoad.Add("Member") | Out-Null
     }
@@ -29,6 +39,7 @@ Function Get-AllGroups {
                 Name                = [string]$entry.name
                 Details             = [string]$entry.description
                 DistinguishedName   = [string]$entry.distinguishedname
+                sAMAccountName      = [string]$entry.samaccountname
                 ManagedBy           = [string]$entry.managedby
                 Members             = [string]$entry.member
             }
@@ -91,6 +102,7 @@ Function Get-UserGroups {
         $searcher = [System.DirectoryServices.DirectorySearcher]::new()
         $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$User))"
         $searcher.PropertiesToLoad.Add("MemberOf") | Out-Null
+        $searcher.PropertiesToLoad.Add("DistinguishedName") | Out-Null
     }
 
     Process {
@@ -98,6 +110,7 @@ Function Get-UserGroups {
         $results = [PSCustomObject]@{
             User   = $User
             Groups = $userGroups.memberof
+            DN     = $userGroups.distinguishedname
         }
     }
 
@@ -106,6 +119,50 @@ Function Get-UserGroups {
         Return $results
     }
 
+}
+
+# Filter down groups and create a table segment
+Function Get-ManagedGroups {
+    $allGroups = Get-AllGroups
+    $myGroups = Get-UserGroups -User $env:username
+    
+    # Filter info down and remove extraneous
+    $filteredGroups = [System.Collections.ArrayList]::new()
+    
+    ForEach ($group in $allGroups) {
+        If (($group.managedby -in $myGroups.Groups) -or
+        ($group.managedby -eq $myGroups.DN)) {
+            $filteredGroups.Add($group) | Out-Null
+        }
+    }
+    
+    $managedGroups = [System.Collections.Generic.List[Object]]::new()
+    $regex = [Regex] '(?= CN=)'
+    
+    For ($i=0;$i -lt $filteredGroups.Count;$i++) {
+        $group = $filteredGroups[$i]
+        $members = $group.Members
+    
+        If ($members) {
+            $split = $regex.Split($members).Trim()
+            $members = $split | ForEach-Object {($_ -Split ",")[0] -Replace "CN="}
+        }
+    
+        $add = [PSCustomObject]@{
+            Name                = $group.Name
+            Details             = $group.Details
+            DistinguishedName   = $group.DistinguishedName
+            sAMAccountName      = $group.sAMAccountName
+            ManagedBy           = $group.ManagedBy
+            Members             = $members
+        }
+    
+        $managedGroups.Add($add)
+    }
+    
+    $allGroups = $null
+    $myGroups = $null
+    $syncHash.ManagedGroups = $managedGroups | Sort-Object Name
 }
 
 Function Set-ProgressMessage {
@@ -191,194 +248,296 @@ Function Close-Window {
     )
 }
 
-Function Start-ProcessingListItems {
-    Param(
-        $collection,
-        $name,
-        $element
-    )
-
-    # Based on the amount of total objects, figure out how to divide them
-    # into smaller groups for processing
-    $count = ($syncHash.$collection).Count
-
-    If ($count -le 100) { $division = 10 }
-    If (($count -gt 101) -and ($count -le 500)) { $division = 25 }
-    If (($count -gt 501) -and ($count -le 1000)) { $division = 50 }
-    If ($count -gt 1001) { $division = 100 }
-    
-    # create array of work cycles
-    $groups = [System.Collections.ArrayList]::new()
-
-    # If the count doesn't divide evenly, account for the remainder
-    If ($count % $division) {
-        $a = [math]::truncate($count / $division)
-        $b = ($count % $division)
-    } 
-    Else {
-        $a = ($count / $division)
-    }
-
-    For ($i=1;$i -lt ($a + 1);$i++){
-        $total = $i * $division
-        $start = ($total - $division)
-        $end = ($total - 1)
-        $temp = [pscustomobject]@{
-            Group = $i
-            Start = $start
-            End = $end
-        }
-        $groups.Add($temp) | Out-Null
-    }
-    
-    If ($b) {
-        $temp = [pscustomobject]@{
-            Group = $i
-            Start = ($end + 1)
-            End = ($end + $b)
-        }
-        $groups.Add($temp) | Out-Null
-    }
-
-    # Create array for monitoring all the runspaces
-    $runspaceCollection = @()
-
-    # Define some functions that need to be included in the runspaces
-    $n = 0
-    $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $variableEntryA = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList 'syncHash',$syncHash,$null
-
-    # Add the synchronized table to the runspaces
-    $initialSessionState.Variables.Add($variableEntryA)
-
-    # Create a runspace pool to process all of the information
-    $runspacePool = [RunspaceFactory]::CreateRunspacePool(1,20,$initialSessionState,$host)
-    $runspacePool.ApartmentState = "STA"
-    $runspacePool.ThreadOptions  = "ReuseThread"
-    $runspacePool.Open()
-
-    # Define what the runspaces will be doing
-    $scriptBlock = {
-        Param($start, $end, $name, $element, $collection)
-
-        For ($i=$start;$i -lt ($end+1);$i++) {
-            $item = ($syncHash.$collection).Name[$i]
-
-            $newListItem = [pscustomobject]@{
-                Name    = $name+$i 
-                Content = $item
-            }
-            #>
-            #$newListItem = "<ListBoxItem x:Name=`"$name$i`" Content=`"$item`" />`r`n"
-            $syncHash."Add$element".Add($newListItem)
-        }
-        
-    }
-
-    # Begin processing everything
-    # begin working
-    While (!$complete) {
-
-        $start = $groups[$n].Start
-        $end = $groups[$n].End
-        $parameters = @{
-            start = $start
-            end = $end
-            name = $name
-            element = $element
-            collection = $collection
-        }
-
-        # There can only be 10 jobs running at any given time
-        # If there's less than 10, add a job
-        If (($runspaceCollection.Count -le 20) -and ($n -lt $groups.Count)) {
-            # Create the powershell object that's going to run the job
-            $powershell = [powershell]::Create().AddScript($scriptblock).AddParameters($parameters)
-
-            # Add the powerhshell job to the pool
-            $powershell.RunspacePool = $runspacePool
-
-            # Add monitoring to the runspace collection and start the job
-            [collections.arraylist]$runspaceCollection += new-object psobject -property @{
-                Runspace = $powershell.BeginInvoke()
-                PowerShell = $powershell
-            }
-
-            # Iterate n
-            $n++
-        }
-
-        # Check the job status and post results
-        ForEach ($runspace in $runspaceCollection.ToArray()) {
-            If ($runspace.Runspace.IsCompleted) {
-                # Remove the runspace so a new one can be built
-                $runspace.PowerShell.Dispose()
-                $runspaceCollection.Remove($runspace)
-            }
-        }
-
-        # Define the complete parameter
-        if (($n -eq $groups.Count) -and ($runspaceCollection.Count -eq 0)){
-            $complete = $true
-        }
-
-    }
-
-    # Close and dispose of the pool
-    $runspacePool.Close()
-    $runspacePool.Dispose()
-    
-}
-
 Function Show-MainWindow {
 
-    Function GroupList-Event {
-        $selected = $this
-        $i = $selected.Name -Replace "Group"
-        $details = ($syncHash.ManagedGroups[$i]).Details
-        $members = ($syncHash.ManagedGroups[$i]).Members
-        $selected = $syncHash.MainWindow.FindName("Groups").SelectedItems.Count
+    # Listening event for Groups box
+    Function Set-ListEvent {
+        $count = $syncHash.MainWindow.FindName("Groups").SelectedItems.Count
+
+        If ($count) {
+            $item = $syncHash.MainWindow.FindName("Groups").SelectedItems[$count - 1]
+            $details = $item.Details
+        }
+        Else {
+            Return
+        }
+
+        $temp = [System.Collections.ArrayList]::new()
+        For ($i=0;$i -lt $count;$i++) {
+            $item = $syncHash.MainWindow.FindName("Groups").SelectedItems[$i]
+            $temp.Add(($item | Select-Object -Property Members))
+        }
+
+        If ($count -gt 1) {
+            If ($details) {
+                $details = $details + "`r`n`r`n" + "Showing common users between selected groups below."
+            }
+            Else { $details = "Showing common users between selected groups below." }
+
+            $hash = [System.Collections.Hashtable]::new()
+            ForEach ($member in $temp.Members) {
+                If ($hash.ContainsKey($member) -eq $false) {
+                    $hash[$member] = [System.Collections.ArrayList]@($member)
+                }
+                Else {
+                    $hash[$member].Add($member)
+                }
+            }
+
+            $add = [System.Collections.ArrayList]::new()
+            ForEach ($value in $hash.Values) {
+                If ($value.Count -gt ($count -1)) {
+                    $add.Add([pscustomobject]@{
+                        Name = $value[0]
+                    }) | Out-Null
+                }
+            }
+
+        }
+        Else {
+            $add = [System.Collections.ArrayList]::new()
+            ForEach ($member in $temp.Members) {
+                $add.Add([pscustomobject]@{
+                    Name = $member
+                }) | Out-Null
+            }
+        }
 
         $syncHash.MainWindow.FindName("Details").Dispatcher.Invoke(
             [action]{$syncHash.MainWindow.FindName("Details").Text = $details},"Normal"
         )
 
-        If ($selected -gt 0) {
-            
-        }
-        Else {
-            If ($members) {
-                $members = $members | Sort-Object
-                For ($i=0;$i -lt $members.Count;$i++) {
-                    $newListItem = New-Object System.Windows.Controls.ListBoxItem
-                    $newListItem.Name     = "Member$i"
-                    $newListItem.Content  = $members[$i]
-
-                    [void]$syncHash.MainWindow.FindName("AddRemove").Items.Add($newListItem)
-                    [void]$syncHash.MainWindow.RegisterName($newListItem.Name, $newListItem)
-                }
-            }
-        }
-        #>
+        $add = ($syncHash.AddButton + $add)
+        $syncHash.RemoveButton = $null
+        If ($add.Count -gt 1) { $add = $add | Sort-Object -Property Name }
+        $subtract = (Compare-Object -ReferenceObject $syncHash.AllUsers -DifferenceObject $add -Property Name -PassThru) | 
+            Sort-Object -Property Name
+        $syncHash.AddRemove = $add
+        $syncHash.FilterUsers = $subtract
+        $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.FilterUsers
+        $syncHash.MainWindow.FindName("AddRemove").ItemsSource = $syncHash.AddRemove
+ 
     }
 
+    # Listening event to clear everything when nothing is selected
     Function Clear-DetailsAndUsers {
         $status = $syncHash.MainWindow.FindName("Groups").SelectedIndex
 
         If ($status -eq -1) {
-            $items = $syncHash.MainWindow.FindName("AddRemove").Items | Select-Object *
-
-            ForEach ($item in $items) {
-                $syncHash.MainWindow.UnregisterName($item.Name)
-            }
-
             $syncHash.MainWindow.FindName("Details").Dispatcher.Invoke(
                 [action]{$syncHash.MainWindow.FindName("Details").Text = $null},"Normal"
             )
 
-            $syncHash.MainWindow.FindName("AddRemove").Dispatcher.Invoke(
-                [action]{$syncHash.MainWindow.FindName("AddRemove").Items.Clear()},"Normal"
-            )
+            $syncHash.AddRemove = $null
+            $syncHash.MainWindow.FindName("AddRemove").ItemsSource = $syncHash.AddRemove
+            $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.AllUsers
+        }
+    }
+
+    # Listening event to filter users when textbox is used
+    Function Get-UserFilter {
+        $input = $syncHash.MainWindow.FindName("Filter").Text
+        $target = $syncHash.MainWindow.FindName("Users")
+
+        If ($input) {
+            $syncHash.FilterUsers = ($syncHash.AllUsers).Where({$_.Name -like "*$input*"})
+        }
+        Else {
+            $syncHash.FilterUsers = $syncHash.AllUsers
+        }
+
+        If ($syncHash.AddRemove -ne $null) {
+            $syncHash.FilterUsers = ($syncHash.FilterUsers).Where({$_.Name -notin $syncHash.AddRemove})
+        }
+
+        $target.ItemsSource = $syncHash.FilterUsers
+    }
+
+    # Click event for -> button
+    Function Set-AddUser {
+        If ($syncHash.MainWindow.FindName("Users").SelectedItem -eq $null) { Return }
+
+        $input = $syncHash.MainWindow.FindName("Filter").Text
+        $selected = ($syncHash.MainWindow.FindName("Users").SelectedItem | Select-Object -Property Name)
+        $addPool = [System.Collections.ArrayList]::new()
+
+        If ($syncHash.FilterUsers -ne $null) {
+            $userPool = $syncHash.FilterUsers
+        }
+        Else {
+            $userPool = $syncHash.AllUsers
+        }
+
+        $addPool.Add($selected)
+
+        If ($selected.Name -in $syncHash.RemoveButton.Name) {
+            $syncHash.RemoveButton = ($syncHash.RemoveButton).Where({$_.Name -notin $selected.Name})
+            $syncHash.AddButton = ($syncHash.AddButton).Where({$_.Name -notin $selected.Name})
+        }
+        Else {
+            $syncHash.AddButton = $syncHash.AddButton + $addPool
+        }
+
+        If ($syncHash.AddRemove -ne $null) {
+            $addPool = $addPool + $syncHash.AddRemove
+        }
+
+        If ($input) {
+            $regex = ($addPool.Name | ForEach-Object {"($($_))"}) -Join "|"
+            $match = ($userPool).Where({$_.Name -notmatch $regex})
+            If (!$match) {
+                $syncHash.FilterUsers = ($syncHash.AllUsers).Where({$_.Name -notin $syncHash.AddRemove})
+            }
+            Else {
+                $syncHash.FilterUsers = $match
+            }
+        }
+        Else {
+            $syncHash.FilterUsers = (Compare-Object -ReferenceObject $userPool -DifferenceObject $addPool -Property Name -PassThru) | 
+                Sort-Object -Property Name
+        }
+        
+        If ($addPool.Count -gt 1) { $addPool = $addPool | Sort-Object -Property Name }
+        $syncHash.AddRemove = $addPool
+
+        $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.FilterUsers
+        $syncHash.MainWindow.FindName("AddRemove").ItemsSource = $syncHash.AddRemove
+    }
+
+    # Click event for <- button
+    Function Set-RemoveUser {
+        If ($syncHash.MainWindow.FindName("AddRemove").HasItems -eq $false) { Return }
+
+        $input = $syncHash.MainWindow.FindName("Filter").Text
+        $selected = ($syncHash.MainWindow.FindName("AddRemove").SelectedItem | Select-Object -Property Name)
+        $removePool = [System.Collections.ArrayList]::new()
+        
+        If ($syncHash.FilterUsers -ne $null) {
+            $userPool = $syncHash.FilterUsers
+        }
+        Else {
+            $userPool = $syncHash.AllUsers
+        }
+
+        $removePool.Add($selected)
+
+        If ($selected.Name -in $syncHash.AddButton.Name) {
+            $syncHash.AddButton = ($syncHash.AddButton).Where({$_.Name -notin $selected.Name})
+            $syncHash.RemoveButton = ($syncHash.RemoveButton).Where({$_.Name -notin $selected.Name})
+        }
+        Else {
+            $syncHash.RemoveButton = $syncHash.RemoveButton + $removePool
+        }
+
+        If ($syncHash.AddRemove.Name.Count -eq 1) { 
+            $syncHash.AddRemove = $null
+
+            $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.AllUsers
+        }
+        Else {
+            $syncHash.FilterUsers = ($syncHash.FilterUsers + $removePool) | Sort-Object -Property Name
+            $syncHash.AddRemove = ($syncHash.AddRemove).Where({$_.Name -notin $removePool.Name})
+
+            $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.FilterUsers
+        }
+
+        If ($input) {
+            $syncHash.MainWindow.FindName("Filter").Clear()
+        }
+
+        $syncHash.AddButton = ($syncHash.AddButton).Where({$_.Name -notin $removePool.Name})
+        $syncHash.MainWindow.FindName("AddRemove").ItemsSource = $syncHash.AddRemove
+
+    }
+
+    # Click event for Apply button
+    Function Set-Changes {
+        # figure out what groups are selected and the differences between
+        # group membership and the add/remove box
+        $selected = $syncHash.MainWindow.FindName("Groups").SelectedItems
+
+        If (($selected) -and ($syncHash.AddButton -or $syncHash.RemoveButton)) {
+            # Disable the main window controls
+            $controls = @("Groups","Users","Details","AddRemove","MoveTo","MoveFrom","Apply")
+            ForEach ($control in $controls) {
+                $syncHash.MainWindow.FindName($control).IsEnabled = $false
+            }
+
+            # Prepare the 'are you sure?' message box
+            $buttons = [System.Windows.MessageBoxButton]::OKCancel
+            $icon    = [System.Windows.MessageBoxImage]::Information
+            $title   = "Add/Remove Users"
+            $body    = "Do you want to make the following changes?`r`rGroups:`r`n$($selected.Name | Out-String)`r`n"
+
+            If ($syncHash.AddButton) {
+                $body = $body + "Add Users:`r" + ($syncHash.AddButton.Name | Out-String) + "`r"
+            }
+            If ($syncHash.RemoveButton) {
+                $body = $body + "Remove Users:`r" + ($syncHash.RemoveButton.Name | Out-String)
+            }
+
+            $result = [System.Windows.MessageBox]::Show($body,$title,$buttons,$icon)
+
+            If ($result -eq "OK") {
+                # Create a connection to the domain
+                $context   = [System.DirectoryServices.AccountManagement.ContextType]::Domain
+                $principal = [System.DirectoryServices.AccountManagement.PrincipalContext]::new($context)
+                $idType    = [System.DirectoryServices.AccountManagement.IdentityType]::SamAccountName
+
+                ForEach ($group in $selected) {
+                    # Define the Directory Services Group
+                    $sam    = $group.sAMAccountName
+                    $target = [System.DirectoryServices.AccountManagement.GroupPrincipal]::FindByIdentity($principal,$sam)
+
+                    # Add users to the group
+                    If ($syncHash.AddButton) {
+                        ForEach ($member in $syncHash.AddButton) {
+                            $userSam = (($syncHash.AllUsers).Where({$_.Name -eq $member.Name})).SAM
+                            $target.Members.Add($principal,$idType,$userSam)
+                        }
+                    }
+
+                    # Remove users from the group
+                    If ($syncHash.RemoveButton) {
+                        ForEach ($member in $syncHash.RemoveButton) {
+                            $userSam = (($syncHash.AllUsers).Where({$_.Name -eq $member.Name})).SAM
+                            $target.Members.Remove($principal,$idType,$userSam)
+                        }
+                    }
+
+                    # Save changes made to the group
+                    $target.Save()
+                }
+
+                # Update the group data
+                Get-ManagedGroups
+                $syncHash.AddRemove = $syncHash.AddButton = $syncHash.RemoveButton = $null
+                $syncHash.MainWindow.FindName("Filter").Clear()
+                $syncHash.MainWindow.FindName("Groups").ItemsSource = $syncHash.ManagedGroups
+                $syncHash.MainWindow.FindName("AddRemove").ItemsSource = $syncHash.AddRemove
+                $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.AllUsers
+            }
+            Else {
+                # Unlock controls but do nothing
+            }
+
+            ForEach ($control in $controls) {
+                $syncHash.MainWindow.FindName($control).IsEnabled = $true
+            }
+        }
+        ElseIf (($selected) -and (-Not($syncHash.AddButton -or $syncHash.RemoveButton))) {
+            $buttons = [System.Windows.MessageBoxButton]::OK
+            $icon    = [System.Windows.MessageBoxImage]::Information
+            $title   = "Add/Remove Users"
+            $body    = "There are no add or removes to perform."
+            [System.Windows.MessageBox]::Show($body,$title,$buttons,$icon)
+        }
+        Else {
+            $buttons = [System.Windows.MessageBoxButton]::OK
+            $icon    = [System.Windows.MessageBoxImage]::Information
+            $title   = "Add/Remove Users"
+            $body    = "You have not selected any groups to perform actions on."
+            [System.Windows.MessageBox]::Show($body,$title,$buttons,$icon)
         }
     }
 
@@ -420,9 +579,7 @@ Function Show-MainWindow {
                 </Grid.ColumnDefinitions>
                 <Grid Grid.Column="0">
                     <ListBox x:Name="Groups" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
-                        Margin="10,5,5,5" SelectionMode="Multiple">
-                        <!-- Replace Groups -->
-                    </ListBox>
+                        Margin="10,5,5,5" SelectionMode="Multiple" DisplayMemberPath="Name"/>
                 </Grid>
                 <Grid Grid.Column="1">
                     <TextBox x:Name="Details" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
@@ -438,9 +595,7 @@ Function Show-MainWindow {
                 </Grid.ColumnDefinitions>
                 <Grid Grid.Column="0">
                     <ListBox x:Name="Users" VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
-                        Margin="10,5,5,5">
-                        <!-- Replace Users -->
-                    </ListBox>
+                        Margin="10,5,5,5" ItemsSource="{Binding}" DisplayMemberPath="Name"/>
                 </Grid> 
                 <Grid Grid.Column="1">
                     <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
@@ -450,7 +605,7 @@ Function Show-MainWindow {
                 </Grid>
                 <Grid Grid.Column="2">
                 <ListBox x:Name="AddRemove" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
-                    Margin="5,5,10,5"/>
+                    Margin="5,5,10,5" DisplayMemberPath="Name"/>
                 </Grid>
             </Grid>
             <!-- Fourth Row -->
@@ -476,44 +631,22 @@ Function Show-MainWindow {
     </Window>
     '
 
-    # Add Groups to the Group element
-    Set-ProgressMessage -message "Loading groups to window"
-    Start-ProcessingListItems -Collection "ManagedGroups" -Name "Group" -Element "Groups"
-    
-    $temp = ($syncHash.AddGroups | Sort-Object -Property Content)
-    ForEach ($item in $temp) {
-        $child = $xml.CreateElement("ListBoxItem", $xml.Window.NamespaceURI)
-        $child.SetAttribute("x:Name",$item.Name)
-        $child.SetAttribute("Content",$item.Content)
-        $xml.GetElementsByTagName("ListBox")[0].AppendChild($child) | Out-Null
-    }
-
-    # Add Users to the User element
-    Set-ProgressMessage -message "Loading users to window"
-    Start-ProcessingListItems -Collection "AllUsers" -Name "User" -Element "Users"
-
-    $temp = ($syncHash.AddUsers | Sort-Object -Property Content)
-    ForEach ($item in $temp) {
-        If ($item.Name) {
-            $child = $xml.CreateElement("ListBoxItem", $xml.Window.NamespaceURI)
-            $child.SetAttribute("x:Name",$item.Name)
-            $child.SetAttribute("Content",$item.Content)
-            $xml.GetElementsByTagName("ListBox")[1].AppendChild($child) | Out-Null
-        }
-    }
-
-    # define the main window
+    # Define the main window
     $reader = New-Object System.Xml.XmlNodeReader $xml
     $syncHash.MainWindow = [Windows.Markup.XamlReader]::Load($reader)
 
-    # Add a listener for each ListBoxItem
-    $listBoxItems = $syncHash.MainWindow.FindName("Groups").Items
-    ForEach ($listBoxItem in $listBoxItems) {
-        $listBoxItem.Add_Selected({ GroupList-Event })
-    }
+    # ...and in this area, bind them.
+    $syncHash.MainWindow.FindName("Groups").ItemsSource = $syncHash.ManagedGroups
+    $syncHash.MainWindow.FindName("Users").ItemsSource = $syncHash.AllUsers
+    $syncHash.MainWindow.FindName("LoggedIn").Text = "Logged in as: $($env:USERNAME)"
 
-    # Add a listener to the Listbox
+    # Add listeners
     $syncHash.MainWindow.FindName("Groups").Add_SelectionChanged({ Clear-DetailsAndUsers })
+    $syncHash.MainWindow.FindName("Groups").Add_SelectionChanged({ Set-ListEvent })
+    $syncHash.MainWindow.FindName("Filter").Add_TextChanged({ Get-UserFilter })
+    $syncHash.MainWindow.FindName("MoveTo").Add_Click({ Set-AddUser })
+    $syncHash.MainWindow.FindName("MoveFrom").Add_Click({ Set-RemoveUser })
+    $syncHash.MainWindow.FindName("Apply").Add_Click({ Set-Changes })
 
     Close-Window
     [void]$syncHash.MainWindow.ShowDialog()
@@ -525,48 +658,8 @@ Show-ProgressWindow
 Set-ProgressMessage -message "Gathering group information"
 
 # Get bulk information from AD
-$allGroups = Get-AllGroups
-$syncHash.AllUsers = Get-AllUsers | Sort-Object Name
-$myGroups = Get-UserGroups -User $env:username
-
-# Filter info down and remove extraneous
-$filteredGroups = [System.Collections.ArrayList]::new()
-Set-ProgressMessage -message "Filtering groups"
-
-ForEach ($group in $allGroups) {
-    If ($group.managedby -in $myGroups.Groups) {
-        $filteredGroups.Add($group) | Out-Null
-    }
-}
-
-$managedGroups = [System.Collections.Generic.List[Object]]::new()
-$regex = [Regex] '(?= CN=)'
-
-For ($i=0;$i -lt $filteredGroups.Count;$i++) {
-    $group = $filteredGroups[$i]
-    $members = $group.Members
-
-    If ($members) {
-        $split = $regex.Split($members).Trim()
-        $members = $split | ForEach-Object {($_ -Split ",")[0] -Replace "CN="}
-    }
-
-    $add = [PSCustomObject]@{
-        Name                = $group.Name
-        Details             = $group.Details
-        DistinguishedName   = $group.DistinguishedName
-        ManagedBy           = $group.ManagedBy
-        Members             = $members
-    }
-
-    $managedGroups.Add($add)
-}
-
-$allGroups = $null
-$myGroups = $null
-$syncHash.ManagedGroups = $managedGroups | Sort-Object Name
-$syncHash.AddGroups = [System.Collections.ArrayList]::new()
-$syncHash.AddUsers = [System.Collections.ArrayList]::new()
+$syncHash.AllUsers = (Get-AllUsers | Sort-Object Name)
+Get-ManagedGroups
 
 # Close progress window and open main form
 Show-MainWindow
