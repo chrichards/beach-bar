@@ -269,7 +269,9 @@ Function Show-MainWindow {
         $temp = [System.Collections.ArrayList]::new()
         For ($i=0;$i -lt $count;$i++) {
             $item = $groupCon.SelectedItems[$i]
-            $temp.Add(($item | Select-Object -Property Members))
+            If ($item.Members) {
+                $temp.Add(($item | Select-Object -Property Members))
+            }
         }
 
         If ($count -gt 1) {
@@ -340,9 +342,25 @@ Function Show-MainWindow {
                 [action]{$detailCon.Text = $null},"Normal"
             )
 
-            $memberCon.ItemsSource = $syncHash.AddRemove = $null
+            If ($syncHash.AddButton -ne $null) {
+                $memberCon.ItemsSource = $syncHash.AddRemove = $syncHash.AddButton
+            }
             $userCon.ItemsSource = ($syncHash.AllUsers | Sort-Object Name)
         }
+    }
+
+    # Click event to clear everything out
+    Function Clear-All {
+        $detailCon.Dispatcher.Invoke(
+                [action]{$detailCon.Text = $null},"Normal"
+        )
+
+        $groupCon.UnselectAll()
+        $userCon.UnselectAll()
+        $filterCon.Clear()
+        $syncHash.AddButton = $syncHash.RemoveButton = $null
+        $memberCon.ItemsSource = $syncHash.AddRemove = $null
+        $userCon.ItemsSource = ($syncHash.AllUsers | Sort-Object Name)
     }
 
     # Listening event to filter users when textbox is used
@@ -357,7 +375,7 @@ Function Show-MainWindow {
         }
 
         If ($syncHash.AddRemove -ne $null) {
-            $syncHash.FilterUsers = (($syncHash.FilterUsers).Where({$_.Name -notin $syncHash.AddRemove}) | Sort-Object Name)
+            $syncHash.FilterUsers = ($syncHash.FilterUsers).Where({$_.Name -notin $syncHash.AddRemove.Name})
         }
 
         If ($syncHash.FilterUsers.Count -gt 1) {
@@ -372,7 +390,7 @@ Function Show-MainWindow {
         If ($userCon.SelectedItem -eq $null) { Return }
 
         $data = $filterCon.Text
-        $selected = ($userCon.SelectedItem | Select-Object Name)
+        $selected = ($userCon.SelectedItem | Select-Object Name | Sort-Object Name)
         $addPool = [System.Collections.ArrayList]::new()
 
         If ($syncHash.FilterUsers -ne $null) {
@@ -407,13 +425,13 @@ Function Show-MainWindow {
             }
         }
         Else {
-            $syncHash.FilterUsers = (Compare-Object -ReferenceObject $userPool -DifferenceObject $addPool -Property Name -PassThru) | 
-                Sort-Object Name
+            $filter = ($addPool.Name -Replace "(?=^)|(?=$)","'$1") -Join ","
+            $syncHash.FilterUsers = ($syncHash.AllUsers.Select("Name NOT IN ($filter)") | Sort-Object Name)
         }
         
-        If ($addPool.Count -gt 1) { $addPool = $addPool | Sort-Object -Property Name }
+        If ($addPool.Count -gt 1) { $addPool = $addPool | Sort-Object Name }
 
-        $userCon.ItemsSource = ($syncHash.FilterUsers | Sort-Object Name)
+        $userCon.ItemsSource = $syncHash.FilterUsers
         $memberCon.ItemsSource = $syncHash.AddRemove = $addPool
     }
 
@@ -422,15 +440,8 @@ Function Show-MainWindow {
         If ($addCon.HasItems -eq $false) { Return }
 
         $data = $filterCon.Text
-        $selected = ($memberCon.SelectedItem | Select-Object Name)
+        $selected = ($memberCon.SelectedItem | Select-Object Name | Sort-Object Name)
         $removePool = [System.Collections.ArrayList]::new()
-        
-        If ($syncHash.FilterUsers -ne $null) {
-            $userPool = $syncHash.FilterUsers
-        }
-        Else {
-            $userPool = $syncHash.AllUsers
-        }
 
         $removePool.Add($selected)
 
@@ -448,10 +459,10 @@ Function Show-MainWindow {
             $userCon.ItemsSource = ($syncHash.AllUsers | Sort-Object Name)
         }
         Else {
-            $syncHash.FilterUsers = ($syncHash.FilterUsers + $removePool) | Sort-Object -Property Name
+            $syncHash.FilterUsers = (($syncHash.FilterUsers + $removePool) | Sort-Object Name)
             $syncHash.AddRemove = ($syncHash.AddRemove).Where({$_.Name -notin $removePool.Name})
 
-            $userCon.ItemsSource = ($syncHash.FilterUsers | Sort-Object Name)
+            $userCon.ItemsSource = $syncHash.FilterUsers
         }
 
         If ($data) {
@@ -631,15 +642,20 @@ Function Show-MainWindow {
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
                 <Grid Grid.Column="0">
-                    <TextBox x:Name="Filter" HorizontalAlignment="Stretch" Height="23" Margin="10,5,5,5"/>
+                    <StackPanel>
+                        <Label Content="User Filter:" Target="{Binding ElementName=Filter}" Margin="5,0,0,0"/>
+                        <TextBox x:Name="Filter" HorizontalAlignment="Stretch" Height="23" Margin="10,0,0,0"/>
+                    </StackPanel>
                 </Grid>
                 
                 <Grid Grid.Column="1">
                     <TextBlock x:Name="Spacer" Margin="2"/>
                 </Grid>
                 <Grid Grid.Column="2">
-                    <Button x:Name="Apply" Content="Apply" Style="{StaticResource ButtonStyle}"
-                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Orientation="Horizontal">
+                        <Button x:Name="Clear" Content="Clear" Style="{StaticResource ButtonStyle}"/>
+                        <Button x:Name="Apply" Content="Apply" Style="{StaticResource ButtonStyle}"/>
+                    </StackPanel>
                 </Grid>
             </Grid>
         </Grid>
@@ -659,6 +675,7 @@ Function Show-MainWindow {
     $script:removeCon = $syncHash.MainWindow.FindName("MoveFrom")
     $script:memberCon = $syncHash.MainWindow.FindName("AddRemove")
     $script:filterCon = $syncHash.MainWindow.FindName("Filter")
+    $script:clearCon  = $syncHash.MainWindow.FindName("Clear")
     $script:applyCon  = $syncHash.MainWindow.FindName("Apply")
 
     # ...and in this area, bind them.
@@ -671,6 +688,7 @@ Function Show-MainWindow {
     $filterCon.Add_TextChanged({ Get-UserFilter })
     $addCon.Add_Click({ Set-AddUser })
     $removeCon.Add_Click({ Set-RemoveUser })
+    $clearCon.Add_Click({ Clear-All })
     $applyCon.Add_Click({ Set-Changes })
 
     Close-Window
