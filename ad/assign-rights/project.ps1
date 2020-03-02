@@ -320,7 +320,8 @@ Function Show-MainWindow {
         $syncHash.RemoveButton = $null
 
         If ($add.Count -ne 0) { 
-            $filter = ($add.Name -Replace "(?=^)|(?=$)","'$1") -Join ","
+            $escape = ($add.Name -Replace "'","''")
+            $filter = ($escape -Replace "(?=^)|(?=$)","'$1") -Join ","
             $subtract = ($syncHash.AllUsers.Select("Name NOT IN ($filter)") | Sort-Object Name)
         }
         Else {
@@ -342,9 +343,8 @@ Function Show-MainWindow {
                 [action]{$detailCon.Text = $null},"Normal"
             )
 
-            If ($syncHash.AddButton -ne $null) {
-                $memberCon.ItemsSource = $syncHash.AddRemove = $syncHash.AddButton
-            }
+            $syncHash.AddButton = $syncHash.RemoveButton = $null
+            $memberCon.ItemsSource = $syncHash.AddRemove = $null
             $userCon.ItemsSource = ($syncHash.AllUsers | Sort-Object Name)
         }
     }
@@ -374,13 +374,19 @@ Function Show-MainWindow {
             $syncHash.FilterUsers = ($syncHash.AllUsers | Sort-Object Name)
         }
 
-        If ($syncHash.AddRemove -ne $null) {
-            $syncHash.FilterUsers = ($syncHash.FilterUsers).Where({$_.Name -notin $syncHash.AddRemove.Name})
+        If (!$syncHash.FilterUsers.Count) {
+            $temp = [System.Collections.ArrayList]::new()
+            $syncHash.FilterUsers | ForEach-Object {
+                $temp.Add([PSCustomObject]@{
+                    Name = $_.Name
+                    DN   = $_.DN
+                    SAM  = $_.SAM
+                })
+            }
+            $syncHash.FilterUsers = $temp
         }
 
-        If ($syncHash.FilterUsers.Count -gt 1) {
-            $syncHash.FilterUsers = $syncHash.FilterUsers
-        }
+        $syncHash.FilterUsers = ($syncHash.FilterUsers).Where({$_.Name -notin $syncHash.AddRemove.Name})
 
         $userCon.ItemsSource = $syncHash.FilterUsers
     }
@@ -418,7 +424,7 @@ Function Show-MainWindow {
             $regex = ($addPool.Name | ForEach-Object {"($($_))"}) -Join "|"
             $match = ($userPool).Where({$_.Name -notmatch $regex})
             If (!$match) {
-                $syncHash.FilterUsers = ($syncHash.AllUsers).Where({$_.Name -notin $syncHash.AddRemove})
+                $syncHash.FilterUsers = (($syncHash.AllUsers).Where({$_.Name -notin $syncHash.AddRemove}) | Sort-Object Name)
             }
             Else {
                 $syncHash.FilterUsers = $match
@@ -460,7 +466,6 @@ Function Show-MainWindow {
         }
         Else {
             $syncHash.FilterUsers = (($syncHash.FilterUsers + $removePool) | Sort-Object Name)
-            $syncHash.AddRemove = ($syncHash.AddRemove).Where({$_.Name -notin $removePool.Name})
 
             $userCon.ItemsSource = $syncHash.FilterUsers
         }
@@ -469,7 +474,7 @@ Function Show-MainWindow {
             $filterCon.Clear()
         }
 
-        $memberCon.ItemsSource = $syncHash.AddRemove = ($syncHash.AddButton).Where({$_.Name -notin $removePool.Name})
+        $memberCon.ItemsSource = $syncHash.AddRemove = ($syncHash.AddRemove).Where({$_.Name -notin $removePool.Name})
 
     }
 
@@ -540,7 +545,7 @@ Function Show-MainWindow {
                 $filterCon.Clear()
                 $groupCon.ItemsSource = $syncHash.ManagedGroups
                 $memberCon.ItemsSource = $syncHash.AddRemove
-                $userCon.ItemsSource = $syncHash.AllUsers
+                $userCon.ItemsSource = ($syncHash.AllUsers | Sort-Object Name)
             }
             Else {
                 # Unlock controls but do nothing
